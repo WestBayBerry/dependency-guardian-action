@@ -1,0 +1,56 @@
+name: "Dependency Guardian"
+description: "Scan dependency changes in PRs for supply chain security risks"
+author: "WestBayBerry"
+
+inputs:
+  api_key:
+    description: "Dependency Guardian API key (dg_live_xxx). Get yours at https://westbayberry.com/dashboard"
+    required: true
+  github_token:
+    description: "GitHub token for API access"
+    required: false
+    default: "${{ github.token }}"
+  block_threshold:
+    description: "Risk score threshold to fail the check (0-100)"
+    required: false
+    default: "70"
+  warn_threshold:
+    description: "Risk score threshold to show warnings (0-100)"
+    required: false
+    default: "60"
+  noteworthy_threshold:
+    description: "Risk score threshold for informational 'noteworthy' reporting (0-100)"
+    required: false
+    default: "25"
+  mode:
+    description: "Action mode: block (fail on threshold), warn (warnings only), off (logging only)"
+    required: false
+    default: "warn"
+  allowlist:
+    description: "Comma-separated list of package names to skip"
+    required: false
+    default: ""
+  max_packages:
+    description: "Maximum number of changed packages to analyze"
+    required: false
+    default: "200"
+  include_dev:
+    description: "Whether to include devDependencies in blocking logic (high-confidence signals always block)"
+    required: false
+    default: "false"
+  fresh_publish_hours:
+    description: "Hours threshold for flagging recently published versions"
+    required: false
+    default: "48"
+  young_repo_days:
+    description: "Days threshold for flagging young GitHub repositories"
+    required: false
+    default: "30"
+  low_stars_threshold:
+    description: "Star count threshold for low GitHub engagement"
+    required: false
+    default: "5"
+
+runs:
+  using: "node20"
+  main: "dist/index.js"
