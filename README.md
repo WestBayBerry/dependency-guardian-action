@@ -2,7 +2,7 @@
 
 **Supply chain security that detects malicious behavior, not just known vulnerabilities.**
 
-Tools like Snyk, Dependabot, and npm audit check packages against a database of known CVEs. If an attacker compromises a legitimate package and injects credential-stealing code, those tools see nothing — the CVE doesn't exist yet. The 2.5-to-12-hour window between a package being compromised and being removed from the registry is the kill zone, and database scanners are blind during all of it. Dependency Guardian takes a different approach: it analyzes what the code actually *does*. Shell execution on install, outbound network calls, credential file reads, environment variable exfiltration, code obfuscation, time-gated payloads — these are behavioral signals that malware can't hide, regardless of whether it's been reported yet. The 2025 attack wave proved this isn't theoretical: the [Shai-Hulud worm](https://socket.dev/blog/shai-hulud-npm-worm) compromised 500+ packages in 24 hours, the [S1ngularity campaign](https://www.paloaltonetworks.com/blog/prisma-cloud/malicious-packages-in-npm/) harvested 2,349 credentials from 1,079 developer systems, and the [Chalk/Debug attack](https://blog.phylum.io/chalk-debug-npm-malware/) injected malicious code into 18 packages with 2.6 billion combined weekly downloads. None were in any CVE database when they hit.
+Tools like Snyk, Dependabot, and npm audit check packages against a database of known CVEs. If an attacker compromises a legitimate package and injects credential-stealing code, those tools see nothing — the CVE doesn't exist yet. The 2.5-to-12-hour window between a package being compromised and being removed from the registry is the kill zone, and database scanners are blind during all of it. Dependency Guardian takes a different approach: it analyzes what the code actually *does*. Shell execution on install, outbound network calls, credential file reads, environment variable exfiltration, code obfuscation, time-gated payloads — these are behavioral signals that malware can't hide, regardless of whether it's been reported yet. The 2025 attack wave proved this isn't theoretical: the [Shai-Hulud worm](https://www.cisa.gov/news-events/alerts/2025/09/23/widespread-supply-chain-compromise-impacting-npm-ecosystem) compromised 500+ packages in 24 hours, the [S1ngularity campaign](https://www.wiz.io/blog/s1ngularity-supply-chain-attack) harvested 2,349 credentials from 1,079 developer systems, and the [Chalk/Debug attack](https://www.wiz.io/blog/widespread-npm-supply-chain-attack-breaking-down-impact-scope-across-debug-chalk) injected malicious code into 18 packages with 2.6 billion combined weekly downloads. None were in any CVE database when they hit.
 
 ---
 
@@ -206,7 +206,6 @@ The open-source client means you can audit exactly what data leaves your CI envi
 
 The detection engine is closed because detection logic that's public is detection logic that attackers can test against. The same reason antivirus signatures aren't published. We'd rather have attackers guess than iterate.
 
-Enterprise customers can request a source code audit of the detection engine under NDA. Email [security@westbayberry.com](mailto:security@westbayberry.com).
 
 ---
 
