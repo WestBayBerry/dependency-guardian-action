@@ -141,7 +141,7 @@ These are the major supply chain attacks of 2025. Each row shows which detectors
 | 8 | **Sensitive Path** | String references to `.ssh`, `.aws`, `/etc/shadow`, Kubernetes configs, keychains |
 | 9 | **Binary Addon** | Native binaries (`.node`, `.so`, `.dll`, `.exe`) with ELF/PE/Mach-O magic-byte verification |
 | 10 | **Filesystem Persistence** | Writes to crontab, systemd, `.bashrc`, SSH `authorized_keys`, Windows registry, LaunchAgents |
-| 11 | **CI Secret Access** | Reads of `NPM_TOKEN`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, and 50+ CI/CD variables |
+| 11 | **CI Secret Access** | Reads of `NPM_TOKEN`, `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, and 20+ named CI/CD tokens |
 | 12 | **Suspicious API** | Use of `vm`, `worker_threads`, `inspector`, `process.binding`, native FFI bindings |
 | 13 | **GitHub Reputation** | Ghost repositories, low stars, archived/dormant repos, fake popularity, borrowed repo URLs |
 | 14 | **Source-Registry Mismatch** | Compares npm tarball against GitHub source tree to detect trojaned packages |
@@ -213,9 +213,8 @@ The detection engine is closed because detection logic that's public is detectio
 
 - **npm only** — Analyzes `package-lock.json` and `package.json`. Yarn and pnpm lockfile parsing is not yet implemented.
 - **Static analysis only** — Pattern matching on source code. No dynamic execution or runtime sandboxing.
-- **10 MB tarball cap** — Packages with tarballs larger than 10 MB are skipped.
-- **2 MB scan budget** — Only the first 2 MB of JS/TS content per package is analyzed.
-- **No private registry support** — Only fetches from the public npm registry.
+- **50 MB tarball cap** — Packages with tarballs larger than 50 MB are skipped.
+- **15 MB scan budget** — Only the first 15 MB of JS/TS content per package is analyzed.
 
 ---
 
