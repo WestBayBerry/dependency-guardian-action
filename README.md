@@ -211,7 +211,7 @@ The detection engine is closed because detection logic that's public is detectio
 
 ## Known Limitations
 
-- **npm only** — Analyzes `package-lock.json` and `package.json`. Yarn and pnpm lockfile parsing is not yet implemented.
+- **npm + PyPI** — Supports `package.json`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` (npm) and `requirements.txt`, `Pipfile.lock`, `poetry.lock` (PyPI). Ecosystem is detected automatically from changed files.
 - **Static analysis only** — Pattern matching on source code. No dynamic execution or runtime sandboxing.
 - **50 MB tarball cap** — Packages with tarballs larger than 50 MB are skipped.
 - **15 MB scan budget** — Only the first 15 MB of JS/TS content per package is analyzed.
