@@ -29969,6 +29969,9 @@ const pr_files_1 = __nccwpck_require__(7973);
 const parse_package_lock_1 = __nccwpck_require__(2295);
 const diff_1 = __nccwpck_require__(4210);
 const parse_package_json_1 = __nccwpck_require__(7414);
+const parse_requirements_1 = __nccwpck_require__(2029);
+const parse_pipfile_lock_1 = __nccwpck_require__(5458);
+const parse_poetry_lock_1 = __nccwpck_require__(2704);
 const API_BASE = "https://api.westbayberry.com";
 async function runAPIMode(apiKey) {
     try {
@@ -29985,61 +29988,92 @@ async function runAPIMode(apiKey) {
             core.info("Not a pull request event — skipping dependency analysis.");
             return;
         }
-        core.info(`PR #${prInfo.prNumber}: ${prInfo.dependencyFilesChanged.length} dependency file(s) changed`);
+        core.info(`PR #${prInfo.prNumber}: ${prInfo.dependencyFilesChanged.length} dependency file(s) changed` +
+            ` (${prInfo.npmFilesChanged.length} npm, ${prInfo.pypiFilesChanged.length} pypi)`);
         if (prInfo.dependencyFilesChanged.length === 0) {
             core.info("No dependency files changed in this PR.");
             return;
         }
         // Extract changed packages (lockfile parsing stays local)
-        const changes = await extractChanges(config, prInfo.baseSha);
-        if (changes.length === 0) {
-            core.info("No package changes detected (or all are allowlisted).");
+        const { npmChanges, pypiChanges } = await extractChanges(config, prInfo);
+        const allChanges = [...npmChanges, ...pypiChanges];
+        if (allChanges.length === 0) {
+            core.info("No package changes detected.");
             return;
         }
-        const filtered = changes.filter((c) => !config.allowlist.includes(c.name));
-        if (filtered.length === 0) {
+        const npmFiltered = npmChanges.filter((c) => !config.allowlist.includes(c.name));
+        const pypiFiltered = pypiChanges.filter((c) => !config.allowlist.includes(c.name));
+        const allFiltered = [...npmFiltered, ...pypiFiltered];
+        if (allFiltered.length === 0) {
             core.info("All changed packages are allowlisted.");
             return;
         }
-        core.info(`Sending ${filtered.length} package(s) to Detection API...`);
-        // Call the Detection API
+        core.info(`Sending ${npmFiltered.length} npm + ${pypiFiltered.length} pypi package(s) to Detection API...`);
+        // Call the Detection API (npm and pypi in parallel)
         const ctx = github.context;
-        const apiPayload = {
-            packages: filtered.map((c) => ({
-                name: c.name,
-                version: c.newVersion,
-                previousVersion: c.oldVersion,
-                isNew: c.oldVersion === null,
-            })),
-            config: {
-                blockThreshold: config.blockThreshold,
-                warnThreshold: config.warnThreshold,
-                githubToken: config.githubToken,
-            },
-            repoMeta: {
-                owner: ctx.repo.owner,
-                repo: ctx.repo.repo,
-                prNumber: prInfo.prNumber,
-            },
+        const repoMeta = {
+            owner: ctx.repo.owner,
+            repo: ctx.repo.repo,
+            prNumber: prInfo.prNumber,
         };
-        const response = await fetch(`${API_BASE}/v1/analyze`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${apiKey}`,
-                "User-Agent": "dependency-guardian-action/1.0",
-            },
-            body: JSON.stringify(apiPayload),
-        });
-        if (!response.ok) {
-            const errorBody = await response.text();
-            throw new Error(`API returned ${response.status}: ${errorBody}`);
-        }
-        const apiResult = (await response.json());
-        core.info(`API returned: score=${apiResult.score} action=${apiResult.action} packages=${apiResult.packages.length}`);
+        const apiConfig = {
+            blockThreshold: config.blockThreshold,
+            warnThreshold: config.warnThreshold,
+            githubToken: config.githubToken,
+        };
+        const headers = {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+            "User-Agent": "dependency-guardian-action/1.0",
+        };
+        const [npmResponse, pypiResponse] = await Promise.all([
+            npmFiltered.length > 0
+                ? fetch(`${API_BASE}/v1/analyze`, {
+                    method: "POST",
+                    headers,
+                    body: JSON.stringify({
+                        packages: npmFiltered.map((c) => ({
+                            name: c.name,
+                            version: c.newVersion,
+                            previousVersion: c.oldVersion,
+                            isNew: c.oldVersion === null,
+                        })),
+                        config: apiConfig,
+                        repoMeta,
+                    }),
+                })
+                : null,
+            pypiFiltered.length > 0
+                ? fetch(`${API_BASE}/v1/pypi/analyze`, {
+                    method: "POST",
+                    headers,
+                    body: JSON.stringify({
+                        packages: pypiFiltered.map((c) => ({
+                            name: c.name,
+                            version: c.newVersion || "latest",
+                            previousVersion: c.oldVersion,
+                            isNew: c.oldVersion === null,
+                        })),
+                        config: apiConfig,
+                        repoMeta,
+                    }),
+                })
+                : null,
+        ]);
+        // Parse responses
+        const npmResult = npmResponse ? await parseApiResponse(npmResponse) : null;
+        const pypiResult = pypiResponse ? await parseApiResponse(pypiResponse) : null;
+        const mergedApiPackages = [
+            ...(npmResult?.packages ?? []),
+            ...(pypiResult?.packages ?? []),
+        ];
+        const mergedScore = Math.max(npmResult?.score ?? 0, pypiResult?.score ?? 0);
+        const mergedAction = mergedScore >= config.blockThreshold ? "block"
+            : mergedScore >= config.warnThreshold ? "warn" : "pass";
+        core.info(`API returned: score=${mergedScore} action=${mergedAction} packages=${mergedApiPackages.length}`);
         // Convert API response to ScanResult for the reporting module
-        const packageResults = apiResult.packages.map((pkg) => {
-            const change = filtered.find((c) => c.name === pkg.name) ?? {
+        const packageResults = mergedApiPackages.map((pkg) => {
+            const change = allFiltered.find((c) => c.name === pkg.name) ?? {
                 name: pkg.name,
                 oldVersion: null,
                 newVersion: pkg.version,
@@ -30056,7 +30090,7 @@ async function runAPIMode(apiKey) {
         });
         const scanResult = {
             packages: packageResults,
-            maxScore: apiResult.score,
+            maxScore: mergedScore,
             totalScanned: packageResults.length,
             skipped: [],
         };
@@ -30067,6 +30101,13 @@ async function runAPIMode(apiKey) {
         const msg = err instanceof Error ? err.message : String(err);
         core.setFailed(`Dependency Guardian (API mode) failed: ${msg}`);
     }
+}
+async function parseApiResponse(response) {
+    if (!response.ok) {
+        const errorBody = await response.text();
+        throw new Error(`API returned ${response.status}: ${errorBody}`);
+    }
+    return (await response.json());
 }
 function parseConfig() {
     const token = (0, pr_files_1.resolveToken)();
@@ -30091,12 +30132,25 @@ function parseConfig() {
         lowStarsThreshold: Number(core.getInput("low_stars_threshold") || "5"),
     };
 }
-async function extractChanges(config, baseSha) {
+async function extractChanges(config, prInfo) {
+    // --- npm extraction (existing logic) ---
+    let npmChanges = [];
+    if (prInfo.npmFilesChanged.length > 0) {
+        npmChanges = extractNpmChanges(config);
+    }
+    // --- Python extraction ---
+    let pypiChanges = [];
+    if (prInfo.pypiFilesChanged.length > 0) {
+        pypiChanges = extractPythonChanges(config, prInfo);
+    }
+    return { npmChanges, pypiChanges };
+}
+function extractNpmChanges(config) {
     const headLockfile = (0, pr_files_1.getHeadFileContent)("package-lock.json");
     if (headLockfile) {
         core.info("Found package-lock.json — using lockfile diff");
-        const baseLockfile = baseSha
-            ? (0, pr_files_1.getBaseFileContent)(baseSha, "package-lock.json")
+        const baseLockfile = config.githubToken
+            ? (0, pr_files_1.getBaseFileContent)(getBranchBaseSha(), "package-lock.json")
             : null;
         try {
             const headParsed = (0, parse_package_lock_1.parseLockfile)(headLockfile);
@@ -30117,9 +30171,7 @@ async function extractChanges(config, baseSha) {
     const headPkgJson = (0, pr_files_1.getHeadFileContent)("package.json");
     if (headPkgJson) {
         core.info("Falling back to package.json diff");
-        const basePkgJson = baseSha
-            ? (0, pr_files_1.getBaseFileContent)(baseSha, "package.json")
-            : null;
+        const basePkgJson = (0, pr_files_1.getBaseFileContent)(getBranchBaseSha(), "package.json");
         try {
             const result = (0, parse_package_json_1.diffPackageJsons)(basePkgJson, headPkgJson, config.maxPackages);
             return result.changes;
@@ -30130,6 +30182,55 @@ async function extractChanges(config, baseSha) {
         }
     }
     return [];
+}
+function extractPythonChanges(config, prInfo) {
+    const allChanges = [];
+    const baseSha = prInfo.baseSha;
+    for (const pyFile of prInfo.pypiFilesChanged) {
+        const basename = pyFile.split("/").pop() ?? "";
+        const headContent = (0, pr_files_1.getHeadFileContent)(pyFile);
+        if (!headContent)
+            continue;
+        const baseContent = baseSha ? (0, pr_files_1.getBaseFileContent)(baseSha, pyFile) : null;
+        let changes = [];
+        try {
+            if (basename === "Pipfile.lock") {
+                const head = (0, parse_pipfile_lock_1.parsePipfileLock)(headContent);
+                const base = baseContent ? (0, parse_pipfile_lock_1.parsePipfileLock)(baseContent) : null;
+                changes = (0, parse_pipfile_lock_1.diffPipfileLocks)(base, head, config.maxPackages).changes;
+            }
+            else if (basename === "poetry.lock") {
+                const head = (0, parse_poetry_lock_1.parsePoetryLock)(headContent);
+                const base = baseContent ? (0, parse_poetry_lock_1.parsePoetryLock)(baseContent) : null;
+                changes = (0, parse_poetry_lock_1.diffPoetryLocks)(base, head, config.maxPackages).changes;
+            }
+            else if (/requirements.*\.txt$/.test(basename)) {
+                const head = (0, parse_requirements_1.parseRequirements)(headContent);
+                const base = baseContent ? (0, parse_requirements_1.parseRequirements)(baseContent) : null;
+                changes = (0, parse_requirements_1.diffRequirements)(base, head, config.maxPackages).changes;
+            }
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            core.warning(`Failed to parse ${pyFile}: ${msg}`);
+            continue;
+        }
+        for (const c of changes) {
+            if (!allChanges.some((existing) => existing.name === c.name)) {
+                allChanges.push(c);
+            }
+        }
+    }
+    return allChanges;
+}
+function getBranchBaseSha() {
+    try {
+        const ctx = github.context;
+        return ctx.payload.pull_request?.base?.sha ?? "";
+    }
+    catch {
+        return "";
+    }
 }
 function getDirectDeps() {
     try {
@@ -30196,12 +30297,24 @@ const core = __importStar(__nccwpck_require__(7484));
 const github = __importStar(__nccwpck_require__(3228));
 const child_process_1 = __nccwpck_require__(5317);
 const fs = __importStar(__nccwpck_require__(9896));
-const DEPENDENCY_FILES = [
+const NPM_DEPENDENCY_FILES = [
     "package.json",
     "package-lock.json",
     "yarn.lock",
     "pnpm-lock.yaml",
 ];
+const PYTHON_DEPENDENCY_FILES = [
+    "requirements.txt",
+    "Pipfile.lock",
+    "poetry.lock",
+];
+const DEPENDENCY_FILES = [...NPM_DEPENDENCY_FILES, ...PYTHON_DEPENDENCY_FILES];
+function isPythonDepFile(filename) {
+    const basename = filename.split("/").pop() ?? "";
+    if (PYTHON_DEPENDENCY_FILES.includes(basename))
+        return true;
+    return /^requirements[-_].+\.txt$/.test(basename);
+}
 async function getPrFiles(token) {
     const ctx = github.context;
     if (ctx.eventName !== "pull_request" &&
@@ -30209,6 +30322,8 @@ async function getPrFiles(token) {
         return {
             isPullRequest: false,
             dependencyFilesChanged: [],
+            npmFilesChanged: [],
+            pypiFilesChanged: [],
             prNumber: 0,
             baseSha: "",
             headSha: "",
@@ -30219,6 +30334,8 @@ async function getPrFiles(token) {
         return {
             isPullRequest: false,
             dependencyFilesChanged: [],
+            npmFilesChanged: [],
+            pypiFilesChanged: [],
             prNumber: 0,
             baseSha: "",
             headSha: "",
@@ -30234,10 +30351,18 @@ async function getPrFiles(token) {
     });
     const depFiles = files
         .map((f) => f.filename)
-        .filter((f) => DEPENDENCY_FILES.some((df) => f === df || f.endsWith("/" + df)));
+        .filter((f) => DEPENDENCY_FILES.some((df) => f === df || f.endsWith("/" + df)) ||
+        isPythonDepFile(f));
+    const npmFiles = depFiles.filter((f) => {
+        const basename = f.split("/").pop() ?? "";
+        return NPM_DEPENDENCY_FILES.includes(basename);
+    });
+    const pypiFiles = depFiles.filter((f) => isPythonDepFile(f));
     return {
         isPullRequest: true,
         dependencyFilesChanged: depFiles,
+        npmFilesChanged: npmFiles,
+        pypiFilesChanged: pypiFiles,
         prNumber,
         baseSha,
         headSha,
@@ -30498,6 +30623,253 @@ function parseLegacyDeps(deps, packages, parentPrefix = "") {
             parseLegacyDeps(entry.dependencies, packages);
         }
     }
+}
+
+
+/***/ }),
+
+/***/ 5458:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.parsePipfileLock = parsePipfileLock;
+exports.diffPipfileLocks = diffPipfileLocks;
+/**
+ * Parse a Pipfile.lock (JSON format) into package entries.
+ * Pipfile.lock has two sections: "default" (production) and "develop" (dev).
+ * Each entry is keyed by package name with a "version" field like "==1.2.3".
+ */
+function parsePipfileLock(content) {
+    const packages = new Map();
+    const json = JSON.parse(content);
+    parsePipfileSection(json.default, false, packages);
+    parsePipfileSection(json.develop, true, packages);
+    return { packages };
+}
+function parsePipfileSection(section, isDev, packages) {
+    if (!section || typeof section !== "object")
+        return;
+    for (const [rawName, entry] of Object.entries(section)) {
+        if (!entry || typeof entry !== "object")
+            continue;
+        const entryObj = entry;
+        const rawVersion = entryObj.version;
+        if (typeof rawVersion !== "string")
+            continue;
+        const name = normalizePyName(rawName);
+        // Strip leading "==" from version
+        const version = rawVersion.replace(/^==/, "");
+        if (!packages.has(name)) {
+            packages.set(name, { name, version, isDev });
+        }
+    }
+}
+function diffPipfileLocks(base, head, maxPackages) {
+    const changes = [];
+    for (const [name, headEntry] of head.packages) {
+        const baseEntry = base?.packages.get(name);
+        if (!baseEntry) {
+            changes.push({
+                name,
+                oldVersion: null,
+                newVersion: headEntry.version,
+                isDirect: true,
+                isDev: headEntry.isDev,
+            });
+        }
+        else if (baseEntry.version !== headEntry.version) {
+            changes.push({
+                name,
+                oldVersion: baseEntry.version,
+                newVersion: headEntry.version,
+                isDirect: true,
+                isDev: headEntry.isDev,
+            });
+        }
+    }
+    changes.sort((a, b) => a.name.localeCompare(b.name));
+    if (changes.length <= maxPackages) {
+        return { changes, skipped: [] };
+    }
+    return {
+        changes: changes.slice(0, maxPackages),
+        skipped: changes.slice(maxPackages).map((c) => c.name),
+    };
+}
+function normalizePyName(name) {
+    return name.toLowerCase().replace(/[-_.]+/g, "-");
+}
+
+
+/***/ }),
+
+/***/ 2704:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.parsePoetryLock = parsePoetryLock;
+exports.diffPoetryLocks = diffPoetryLocks;
+/**
+ * Parse a poetry.lock file (TOML format) into package entries.
+ * Uses a simple regex-based parser since poetry.lock has a predictable structure:
+ *
+ * [[package]]
+ * name = "package-name"
+ * version = "1.2.3"
+ * category = "main" | "dev"
+ *
+ * We don't need a full TOML parser — just extract package blocks.
+ */
+function parsePoetryLock(content) {
+    const packages = new Map();
+    // Split into [[package]] blocks
+    const blocks = content.split(/^\[\[package\]\]\s*$/m);
+    for (const block of blocks) {
+        const nameMatch = block.match(/^name\s*=\s*"([^"]+)"/m);
+        const versionMatch = block.match(/^version\s*=\s*"([^"]+)"/m);
+        if (!nameMatch || !versionMatch)
+            continue;
+        const name = normalizePyName(nameMatch[1]);
+        const version = versionMatch[1];
+        // Check category (poetry 1.x uses "category", poetry 2.x uses groups)
+        const categoryMatch = block.match(/^category\s*=\s*"([^"]+)"/m);
+        const category = categoryMatch?.[1] ?? "main";
+        const isDev = category === "dev";
+        if (!packages.has(name)) {
+            packages.set(name, { name, version, isDev, category });
+        }
+    }
+    return { packages };
+}
+function diffPoetryLocks(base, head, maxPackages) {
+    const changes = [];
+    for (const [name, headEntry] of head.packages) {
+        const baseEntry = base?.packages.get(name);
+        if (!baseEntry) {
+            changes.push({
+                name,
+                oldVersion: null,
+                newVersion: headEntry.version,
+                isDirect: true,
+                isDev: headEntry.isDev,
+            });
+        }
+        else if (baseEntry.version !== headEntry.version) {
+            changes.push({
+                name,
+                oldVersion: baseEntry.version,
+                newVersion: headEntry.version,
+                isDirect: true,
+                isDev: headEntry.isDev,
+            });
+        }
+    }
+    changes.sort((a, b) => a.name.localeCompare(b.name));
+    if (changes.length <= maxPackages) {
+        return { changes, skipped: [] };
+    }
+    return {
+        changes: changes.slice(0, maxPackages),
+        skipped: changes.slice(maxPackages).map((c) => c.name),
+    };
+}
+function normalizePyName(name) {
+    return name.toLowerCase().replace(/[-_.]+/g, "-");
+}
+
+
+/***/ }),
+
+/***/ 2029:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.parseRequirements = parseRequirements;
+exports.diffRequirements = diffRequirements;
+/**
+ * Parse a requirements.txt file into package entries.
+ * Handles: name==version, name>=version, name~=version, name!=version,
+ * extras like name[extra1,extra2]==version, comments (#), -r includes (ignored),
+ * environment markers (;), and line continuations (\).
+ */
+function parseRequirements(content) {
+    const packages = new Map();
+    // Join line continuations
+    const joined = content.replace(/\\\n/g, "");
+    const lines = joined.split("\n");
+    for (const rawLine of lines) {
+        const line = rawLine.trim();
+        // Skip empty lines, comments, options, and -r/-c references
+        if (!line || line.startsWith("#") || line.startsWith("-") || line.startsWith("--")) {
+            continue;
+        }
+        // Strip environment markers (everything after ;)
+        const withoutMarker = line.split(";")[0].trim();
+        if (!withoutMarker)
+            continue;
+        // Parse package name, extras, and version specifier
+        const match = withoutMarker.match(/^([a-zA-Z0-9][-a-zA-Z0-9_.]*(?:\[[^\]]*\])?)(?:\s*(==|>=|<=|~=|!=|>|<|===)\s*([^\s,;]+))?/);
+        if (!match)
+            continue;
+        const nameWithExtras = match[1];
+        const version = match[3] || "";
+        // Extract extras: name[extra1,extra2] -> name, [extra1, extra2]
+        const extrasMatch = nameWithExtras.match(/^([a-zA-Z0-9][-a-zA-Z0-9_.]*)(?:\[([^\]]*)\])?$/);
+        if (!extrasMatch)
+            continue;
+        const name = normalizePyName(extrasMatch[1]);
+        const extras = extrasMatch[2]
+            ? extrasMatch[2].split(",").map((e) => e.trim()).filter(Boolean)
+            : undefined;
+        if (!packages.has(name)) {
+            packages.set(name, { name, version, extras });
+        }
+    }
+    return { packages };
+}
+/**
+ * Diff two requirements.txt files to find added/changed packages.
+ */
+function diffRequirements(base, head, maxPackages) {
+    const changes = [];
+    for (const [name, headEntry] of head.packages) {
+        const baseEntry = base?.packages.get(name);
+        if (!baseEntry) {
+            changes.push({
+                name,
+                oldVersion: null,
+                newVersion: headEntry.version,
+                isDirect: true,
+                isDev: false,
+            });
+        }
+        else if (baseEntry.version !== headEntry.version) {
+            changes.push({
+                name,
+                oldVersion: baseEntry.version,
+                newVersion: headEntry.version,
+                isDirect: true,
+                isDev: false,
+            });
+        }
+    }
+    changes.sort((a, b) => a.name.localeCompare(b.name));
+    if (changes.length <= maxPackages) {
+        return { changes, skipped: [] };
+    }
+    return {
+        changes: changes.slice(0, maxPackages),
+        skipped: changes.slice(maxPackages).map((c) => c.name),
+    };
+}
+function normalizePyName(name) {
+    return name.toLowerCase().replace(/[-_.]+/g, "-");
 }
 
 

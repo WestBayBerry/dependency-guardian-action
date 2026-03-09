@@ -3,16 +3,32 @@ import * as github from "@actions/github";
 import { execSync } from "child_process";
 import * as fs from "fs";
 
-const DEPENDENCY_FILES = [
+const NPM_DEPENDENCY_FILES = [
   "package.json",
   "package-lock.json",
   "yarn.lock",
   "pnpm-lock.yaml",
 ];
 
+const PYTHON_DEPENDENCY_FILES = [
+  "requirements.txt",
+  "Pipfile.lock",
+  "poetry.lock",
+];
+
+const DEPENDENCY_FILES = [...NPM_DEPENDENCY_FILES, ...PYTHON_DEPENDENCY_FILES];
+
+function isPythonDepFile(filename: string): boolean {
+  const basename = filename.split("/").pop() ?? "";
+  if (PYTHON_DEPENDENCY_FILES.includes(basename)) return true;
+  return /^requirements[-_].+\.txt$/.test(basename);
+}
+
 export interface PrFileInfo {
   isPullRequest: boolean;
   dependencyFilesChanged: string[];
+  npmFilesChanged: string[];
+  pypiFilesChanged: string[];
   prNumber: number;
   baseSha: string;
   headSha: string;
@@ -28,6 +44,8 @@ export async function getPrFiles(token: string): Promise<PrFileInfo> {
     return {
       isPullRequest: false,
       dependencyFilesChanged: [],
+      npmFilesChanged: [],
+      pypiFilesChanged: [],
       prNumber: 0,
       baseSha: "",
       headSha: "",
@@ -39,6 +57,8 @@ export async function getPrFiles(token: string): Promise<PrFileInfo> {
     return {
       isPullRequest: false,
       dependencyFilesChanged: [],
+      npmFilesChanged: [],
+      pypiFilesChanged: [],
       prNumber: 0,
       baseSha: "",
       headSha: "",
@@ -58,12 +78,21 @@ export async function getPrFiles(token: string): Promise<PrFileInfo> {
   const depFiles = files
     .map((f) => f.filename)
     .filter((f) =>
-      DEPENDENCY_FILES.some((df) => f === df || f.endsWith("/" + df))
+      DEPENDENCY_FILES.some((df) => f === df || f.endsWith("/" + df)) ||
+      isPythonDepFile(f)
     );
+
+  const npmFiles = depFiles.filter((f) => {
+    const basename = f.split("/").pop() ?? "";
+    return NPM_DEPENDENCY_FILES.includes(basename);
+  });
+  const pypiFiles = depFiles.filter((f) => isPythonDepFile(f));
 
   return {
     isPullRequest: true,
     dependencyFilesChanged: depFiles,
+    npmFilesChanged: npmFiles,
+    pypiFilesChanged: pypiFiles,
     prNumber,
     baseSha,
     headSha,

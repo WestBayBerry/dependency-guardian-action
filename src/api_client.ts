@@ -4,6 +4,7 @@ import { Config, PackageChange, PackageScanResult, ScanResult, DetectorFinding }
 import { report } from "./reporting";
 import {
   getPrFiles,
+  PrFileInfo,
   getBaseFileContent,
   getHeadFileContent,
   resolveToken,
@@ -11,6 +12,9 @@ import {
 import { parseLockfile } from "./lockfile/parse_package_lock";
 import { diffLockfiles } from "./lockfile/diff";
 import { diffPackageJsons } from "./lockfile/parse_package_json";
+import { parseRequirements, diffRequirements } from "./lockfile/parse_requirements";
+import { parsePipfileLock, diffPipfileLocks } from "./lockfile/parse_pipfile_lock";
+import { parsePoetryLock, diffPoetryLocks } from "./lockfile/parse_poetry_lock";
 
 const API_BASE = "https://api.westbayberry.com";
 
@@ -50,7 +54,8 @@ export async function runAPIMode(apiKey: string): Promise<void> {
     }
 
     core.info(
-      `PR #${prInfo.prNumber}: ${prInfo.dependencyFilesChanged.length} dependency file(s) changed`
+      `PR #${prInfo.prNumber}: ${prInfo.dependencyFilesChanged.length} dependency file(s) changed` +
+      ` (${prInfo.npmFilesChanged.length} npm, ${prInfo.pypiFilesChanged.length} pypi)`
     );
 
     if (prInfo.dependencyFilesChanged.length === 0) {
@@ -59,66 +64,102 @@ export async function runAPIMode(apiKey: string): Promise<void> {
     }
 
     // Extract changed packages (lockfile parsing stays local)
-    const changes = await extractChanges(config, prInfo.baseSha);
-    if (changes.length === 0) {
-      core.info("No package changes detected (or all are allowlisted).");
+    const { npmChanges, pypiChanges } = await extractChanges(config, prInfo);
+    const allChanges = [...npmChanges, ...pypiChanges];
+    if (allChanges.length === 0) {
+      core.info("No package changes detected.");
       return;
     }
 
-    const filtered = changes.filter(
+    const npmFiltered = npmChanges.filter(
       (c) => !config.allowlist.includes(c.name)
     );
-    if (filtered.length === 0) {
+    const pypiFiltered = pypiChanges.filter(
+      (c) => !config.allowlist.includes(c.name)
+    );
+    const allFiltered = [...npmFiltered, ...pypiFiltered];
+
+    if (allFiltered.length === 0) {
       core.info("All changed packages are allowlisted.");
       return;
     }
 
-    core.info(`Sending ${filtered.length} package(s) to Detection API...`);
+    core.info(
+      `Sending ${npmFiltered.length} npm + ${pypiFiltered.length} pypi package(s) to Detection API...`
+    );
 
-    // Call the Detection API
+    // Call the Detection API (npm and pypi in parallel)
     const ctx = github.context;
-    const apiPayload = {
-      packages: filtered.map((c) => ({
-        name: c.name,
-        version: c.newVersion,
-        previousVersion: c.oldVersion,
-        isNew: c.oldVersion === null,
-      })),
-      config: {
-        blockThreshold: config.blockThreshold,
-        warnThreshold: config.warnThreshold,
-        githubToken: config.githubToken,
-      },
-      repoMeta: {
-        owner: ctx.repo.owner,
-        repo: ctx.repo.repo,
-        prNumber: prInfo.prNumber,
-      },
+    const repoMeta = {
+      owner: ctx.repo.owner,
+      repo: ctx.repo.repo,
+      prNumber: prInfo.prNumber,
+    };
+    const apiConfig = {
+      blockThreshold: config.blockThreshold,
+      warnThreshold: config.warnThreshold,
+      githubToken: config.githubToken,
+    };
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+      "User-Agent": "dependency-guardian-action/1.0",
     };
 
-    const response = await fetch(`${API_BASE}/v1/analyze`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "User-Agent": "dependency-guardian-action/1.0",
-      },
-      body: JSON.stringify(apiPayload),
-    });
+    const [npmResponse, pypiResponse] = await Promise.all([
+      npmFiltered.length > 0
+        ? fetch(`${API_BASE}/v1/analyze`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              packages: npmFiltered.map((c) => ({
+                name: c.name,
+                version: c.newVersion,
+                previousVersion: c.oldVersion,
+                isNew: c.oldVersion === null,
+              })),
+              config: apiConfig,
+              repoMeta,
+            }),
+          })
+        : null,
+      pypiFiltered.length > 0
+        ? fetch(`${API_BASE}/v1/pypi/analyze`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              packages: pypiFiltered.map((c) => ({
+                name: c.name,
+                version: c.newVersion || "latest",
+                previousVersion: c.oldVersion,
+                isNew: c.oldVersion === null,
+              })),
+              config: apiConfig,
+              repoMeta,
+            }),
+          })
+        : null,
+    ]);
 
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(`API returned ${response.status}: ${errorBody}`);
-    }
+    // Parse responses
+    const npmResult = npmResponse ? await parseApiResponse(npmResponse) : null;
+    const pypiResult = pypiResponse ? await parseApiResponse(pypiResponse) : null;
 
-    const apiResult = (await response.json()) as APIResponse;
+    const mergedApiPackages = [
+      ...(npmResult?.packages ?? []),
+      ...(pypiResult?.packages ?? []),
+    ];
+    const mergedScore = Math.max(npmResult?.score ?? 0, pypiResult?.score ?? 0);
+    const mergedAction = mergedScore >= config.blockThreshold ? "block"
+      : mergedScore >= config.warnThreshold ? "warn" : "pass";
+
     core.info(
-      `API returned: score=${apiResult.score} action=${apiResult.action} packages=${apiResult.packages.length}`
+      `API returned: score=${mergedScore} action=${mergedAction} packages=${mergedApiPackages.length}`
     );
 
     // Convert API response to ScanResult for the reporting module
-    const packageResults: PackageScanResult[] = apiResult.packages.map((pkg) => {
-      const change = filtered.find((c) => c.name === pkg.name) ?? {
+    const packageResults: PackageScanResult[] = mergedApiPackages.map((pkg) => {
+      const change = allFiltered.find((c) => c.name === pkg.name) ?? {
         name: pkg.name,
         oldVersion: null,
         newVersion: pkg.version,
@@ -136,7 +177,7 @@ export async function runAPIMode(apiKey: string): Promise<void> {
 
     const scanResult: ScanResult = {
       packages: packageResults,
-      maxScore: apiResult.score,
+      maxScore: mergedScore,
       totalScanned: packageResults.length,
       skipped: [],
     };
@@ -147,6 +188,14 @@ export async function runAPIMode(apiKey: string): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err);
     core.setFailed(`Dependency Guardian (API mode) failed: ${msg}`);
   }
+}
+
+async function parseApiResponse(response: Response): Promise<APIResponse> {
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`API returned ${response.status}: ${errorBody}`);
+  }
+  return (await response.json()) as APIResponse;
 }
 
 function parseConfig(): Config {
@@ -176,13 +225,29 @@ function parseConfig(): Config {
 
 async function extractChanges(
   config: Config,
-  baseSha: string
-): Promise<PackageChange[]> {
+  prInfo: PrFileInfo
+): Promise<{ npmChanges: PackageChange[]; pypiChanges: PackageChange[] }> {
+  // --- npm extraction (existing logic) ---
+  let npmChanges: PackageChange[] = [];
+  if (prInfo.npmFilesChanged.length > 0) {
+    npmChanges = extractNpmChanges(config);
+  }
+
+  // --- Python extraction ---
+  let pypiChanges: PackageChange[] = [];
+  if (prInfo.pypiFilesChanged.length > 0) {
+    pypiChanges = extractPythonChanges(config, prInfo);
+  }
+
+  return { npmChanges, pypiChanges };
+}
+
+function extractNpmChanges(config: Config): PackageChange[] {
   const headLockfile = getHeadFileContent("package-lock.json");
   if (headLockfile) {
     core.info("Found package-lock.json — using lockfile diff");
-    const baseLockfile = baseSha
-      ? getBaseFileContent(baseSha, "package-lock.json")
+    const baseLockfile = config.githubToken
+      ? getBaseFileContent(getBranchBaseSha(), "package-lock.json")
       : null;
 
     try {
@@ -214,9 +279,7 @@ async function extractChanges(
   const headPkgJson = getHeadFileContent("package.json");
   if (headPkgJson) {
     core.info("Falling back to package.json diff");
-    const basePkgJson = baseSha
-      ? getBaseFileContent(baseSha, "package.json")
-      : null;
+    const basePkgJson = getBaseFileContent(getBranchBaseSha(), "package.json");
 
     try {
       const result = diffPackageJsons(basePkgJson, headPkgJson, config.maxPackages);
@@ -228,6 +291,57 @@ async function extractChanges(
   }
 
   return [];
+}
+
+function extractPythonChanges(config: Config, prInfo: PrFileInfo): PackageChange[] {
+  const allChanges: PackageChange[] = [];
+  const baseSha = prInfo.baseSha;
+
+  for (const pyFile of prInfo.pypiFilesChanged) {
+    const basename = pyFile.split("/").pop() ?? "";
+    const headContent = getHeadFileContent(pyFile);
+    if (!headContent) continue;
+    const baseContent = baseSha ? getBaseFileContent(baseSha, pyFile) : null;
+
+    let changes: PackageChange[] = [];
+
+    try {
+      if (basename === "Pipfile.lock") {
+        const head = parsePipfileLock(headContent);
+        const base = baseContent ? parsePipfileLock(baseContent) : null;
+        changes = diffPipfileLocks(base, head, config.maxPackages).changes;
+      } else if (basename === "poetry.lock") {
+        const head = parsePoetryLock(headContent);
+        const base = baseContent ? parsePoetryLock(baseContent) : null;
+        changes = diffPoetryLocks(base, head, config.maxPackages).changes;
+      } else if (/requirements.*\.txt$/.test(basename)) {
+        const head = parseRequirements(headContent);
+        const base = baseContent ? parseRequirements(baseContent) : null;
+        changes = diffRequirements(base, head, config.maxPackages).changes;
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      core.warning(`Failed to parse ${pyFile}: ${msg}`);
+      continue;
+    }
+
+    for (const c of changes) {
+      if (!allChanges.some((existing) => existing.name === c.name)) {
+        allChanges.push(c);
+      }
+    }
+  }
+
+  return allChanges;
+}
+
+function getBranchBaseSha(): string {
+  try {
+    const ctx = github.context;
+    return ctx.payload.pull_request?.base?.sha ?? "";
+  } catch {
+    return "";
+  }
 }
 
 function getDirectDeps(): Set<string> {

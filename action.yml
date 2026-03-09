@@ -50,6 +50,10 @@ inputs:
     description: "Star count threshold for low GitHub engagement"
     required: false
     default: "5"
+  ecosystems:
+    description: "Ecosystems to scan: npm, pypi, or auto (detect from changed files)"
+    required: false
+    default: "auto"
 
 runs:
   using: "node20"
